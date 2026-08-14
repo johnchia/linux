@@ -290,6 +290,8 @@ static void _HAL_SERFLASH_ActiveFlash_Set_HW_WP(MS_BOOL bEnable);
 MS_BOOL HAL_FSP_EraseChip(void);
 MS_BOOL HAL_FSP_CheckWriteDone(void);
 MS_BOOL HAL_FSP_ReadREMS4(MS_U8 * pu8Data, MS_U32 u32Size);
+MS_BOOL HAL_FSP_ReadUID(MS_U8 * pu8Data, MS_U32 u32Size, MS_U32 u32Skip);
+MS_BOOL HAL_SERFLASH_ReadUIDBytes(MS_U8 * pu8Data, MS_U32 u32Size);
 
 void HAL_FSP_Entry(void);
 void HAL_FSP_Exit(void);
@@ -2755,6 +2757,14 @@ MS_U64 HAL_SERFLASH_ReadUID(void)
         return FALSE;
     }
 
+/*
+ * The RIU/ISP implementation below is kept exactly as the vendor wrote it, and
+ * is exactly as unreachable as every other RIUISP block in this file. It is
+ * guarded now, which it never was: unguarded, it drove the ISP registers on a
+ * board whose flash is driven by FSP, so it could not read anything and could
+ * leave the controller wedged. See HAL_FSP_ReadUID for the path that runs.
+ */
+#ifdef CONFIG_RIUISP
     _HAL_ISP_Enable();
 
     if(!_HAL_SERFLASH_WaitWriteDone())
@@ -2795,7 +2805,16 @@ MS_U64 HAL_SERFLASH_ReadUID(void)
             goto HAL_SERFLASH_READUID_RETURN;
         }
     }
-    else if( _hal_SERFLASH.u16FlashType == FLASH_IC_W25Q16)
+    /*
+     * 4Bh with four dummy bytes for everything else, rather than refusing.
+     * This used to match only W25Q16 and bail otherwise, which meant every part
+     * larger than 2MB -- that is, every part these boards are actually fitted
+     * with -- took a goto that skipped the trigger-mode restore below and left
+     * the controller wedged. 4Bh is the Winbond convention the clones follow,
+     * and a part that does not implement it clocks out all-zero or all-ones,
+     * which the caller already has to reject anyway.
+     */
+    else
     {
         ISP_WRITE(REG_ISP_SPI_WDATA, 0x4B); // RDUID
         if ( _HAL_SERFLASH_WaitWriteDataRdy() == FALSE )
@@ -2810,10 +2829,6 @@ MS_U64 HAL_SERFLASH_ReadUID(void)
                 goto HAL_SERFLASH_READUID_RETURN;
             }
         }
-    }
-    else
-    {
-         goto HAL_SERFLASH_READUID_RETURN;
     }
 
     ISP_WRITE(REG_ISP_SPI_COMMAND, ISP_SPI_CMD_READ);  // READ
@@ -2839,14 +2854,31 @@ MS_U64 HAL_SERFLASH_ReadUID(void)
 
     ISP_WRITE(REG_ISP_SPI_CECLR, ISP_SPI_CECLR); // SPI CEB dis
 
-    ISP_WRITE(REG_ISP_TRIGGER_MODE, 0x2222); // disable trigger mode
-
-
 HAL_SERFLASH_READUID_RETURN:
 
     ISP_WRITE(REG_ISP_SPI_CECLR, ISP_SPI_CECLR); // SPI CEB dis
 
+    /*
+     * Every exit, not just the successful one. Trigger mode is enabled before
+     * the first thing that can fail, so a goto that skipped this left the
+     * controller in it and hung the next flash access -- which, on a board
+     * running from that flash, is the whole machine.
+     */
+    ISP_WRITE(REG_ISP_TRIGGER_MODE, 0x2222); // disable trigger mode
+
     _HAL_ISP_Disable();
+#else
+    memset(u8ptr, 0, sizeof(u8ptr));
+
+    if (HAL_FSP_ReadUID(u8ptr, u8Size, 0))
+    {
+        for (u8I = 0; u8I < u8Size; u8I++)
+        {
+            u64FlashUId <<= 8;
+            u64FlashUId += u8ptr[u8I];
+        }
+    }
+#endif
 
     MS_SERFLASH_RELEASE_MUTEX(_s32SERFLASH_Mutex);
 
@@ -4467,6 +4499,124 @@ MS_BOOL HAL_FSP_ReadID(MS_U8 *pu8Data, MS_U32 u32Size)
     *(u8ptr + 1) = HAL_FSP_ReadBufs(1);
     *(u8ptr + 2) = HAL_FSP_ReadBufs(2);
     DEBUG_SER_FLASH(E_SERFLASH_DBGLV_DEBUG, printk("%s() out\n", __FUNCTION__));
+    return bRet;
+}
+
+//-------------------------------------------------------------------------------------------------
+// Read Unique ID (4Bh) over the FSP engine.
+//
+// WHY THIS EXISTS ALONGSIDE HAL_SERFLASH_ReadUID
+//
+// The vendor's ReadUID drives the ISP/RIU registers directly and is the only
+// read in this file with no CONFIG_RIUISP guard around it. CONFIG_RIUISP is not
+// a Kconfig symbol in this tree, so it is never defined: every other read here
+// compiles to its HAL_FSP_* form and the flash is driven by the FSP engine --
+// "[FSP] Flash is detected" at probe says so. ReadUID alone therefore talked to
+// a block the driver was not using, which is why it returned nothing whatever
+// opcode it was given, and why an early version that left trigger mode set
+// wedged the controller and with it the machine.
+//
+// This is the same transaction every other FSP read makes: bytes into the write
+// buffer, a size, one fire, one bounded wait. It sets no sticky mode, and it
+// runs under the caller's mutex like the rest of them.
+//
+// 4Bh is opcode plus four dummy bytes, then the ID clocks out. Parts that do not
+// implement it return all-zero or all-ones, which the caller already rejects.
+//-------------------------------------------------------------------------------------------------
+MS_BOOL HAL_FSP_ReadUID(MS_U8 * pu8Data, MS_U32 u32Size, MS_U32 u32Skip)
+{
+    MS_BOOL bRet = TRUE;
+    MS_U32 u32Index;
+    MS_U32 u32Write = 1 + SPI_RDUID_DUMMY + u32Skip;
+
+    DEBUG_SER_FLASH(E_SERFLASH_DBGLV_DEBUG, printk("%s() in\n", __FUNCTION__));
+
+    // 1-1-1 with a plain command phase, as HAL_FSP_ReadID uses. Restored below:
+    // gReadMode is the mode the rest of the driver runs in, and leaving the part
+    // in another one would break every read that follows.
+    HAL_SERFLASH_SelectReadMode(E_SINGLE_MODE);
+
+    // Opcode, then the dummy bytes, then however many bytes of the response we
+    // are clocking past. Everything after the opcode goes out on MOSI while the
+    // part is either ignoring it or already answering, so extra bytes here are
+    // what move the eight-byte capture window further along the stream.
+    HAL_FSP_WriteBufs(0, SPI_CMD_RDUID);
+    for (u32Index = 1; u32Index < u32Write; u32Index++)
+        HAL_FSP_WriteBufs(u32Index, 0x00);
+    FSP_WRITE_MASK(REG_FSP_WBF_SIZE,REG_FSP_WBF_SIZE0(u32Write),REG_FSP_WBF_SIZE0_MASK);
+    FSP_WRITE_MASK(REG_FSP_WBF_SIZE,REG_FSP_WBF_SIZE1(0),REG_FSP_WBF_SIZE1_MASK);
+    FSP_WRITE_MASK(REG_FSP_WBF_SIZE,REG_FSP_WBF_SIZE2(0),REG_FSP_WBF_SIZE2_MASK);
+    FSP_WRITE_MASK(REG_FSP_RBF_SIZE,REG_FSP_RBF_SIZE0(u32Size),REG_FSP_RBF_SIZE0_MASK);
+    FSP_WRITE_MASK(REG_FSP_RBF_SIZE,REG_FSP_RBF_SIZE1(0),REG_FSP_RBF_SIZE1_MASK);
+    FSP_WRITE_MASK(REG_FSP_RBF_SIZE,REG_FSP_RBF_SIZE2(0),REG_FSP_RBF_SIZE2_MASK);
+    FSP_WRITE_MASK(REG_FSP_CTRL,REG_FSP_ENABLE,REG_FSP_ENABLE_MASK);
+    FSP_WRITE_MASK(REG_FSP_CTRL,REG_FSP_NRESET,REG_FSP_RESET_MASK);
+    FSP_WRITE_MASK(REG_FSP_CTRL,REG_FSP_INT,REG_FSP_INT_MASK);
+    FSP_WRITE_MASK(REG_FSP_CTRL,REG_FSP_2NDCMD_OFF,REG_FSP_2NDCMD_MASK);
+    FSP_WRITE_MASK(REG_FSP_CTRL,REG_FSP_3THCMD_OFF,REG_FSP_3THCMD_MASK);
+    FSP_WRITE_MASK(REG_FSP_CTRL,REG_FSP_FSCHK_OFF,REG_FSP_FSCHK_MASK);
+    FSP_WRITE_MASK(REG_FSP_TRIGGER,REG_FSP_FIRE,REG_FSP_TRIGGER_MASK);
+    bRet &= _HAL_FSP_WaitDone();
+    if(!bRet)
+    {
+        printk("[FSP] Read UID FAIL Timeout !!!!\r\n");
+    }
+
+    for( u32Index = 0; u32Index < u32Size; u32Index++ )
+        *(pu8Data + u32Index) = HAL_FSP_ReadBufs(u32Index);
+
+    HAL_SERFLASH_SelectReadMode(gReadMode);
+
+    DEBUG_SER_FLASH(E_SERFLASH_DBGLV_DEBUG, printk("%s() out\n", __FUNCTION__));
+    return bRet;
+}
+
+//-------------------------------------------------------------------------------------------------
+// The whole unique ID, which on these parts is sixteen bytes rather than eight.
+//
+// Only the second half identifies the unit. Bytes 0-7 are ASCII "AP3P056" plus
+// a revision byte -- a product/lot code, byte-identical on two boards measured
+// -- and of the rest only bytes 9 and 10 differed between them. An address
+// derived from the first half alone would therefore be the same on every camera
+// carrying this flash, which is the collision this exists to prevent, so the
+// caller is given all sixteen and folds the lot.
+//
+// The read buffer is eight bytes deep, so this is two transactions: the second
+// clocks eight bytes further into the response before capturing. Both run under
+// one mutex acquisition, because they are one logical read.
+//-------------------------------------------------------------------------------------------------
+MS_BOOL HAL_SERFLASH_ReadUIDBytes(MS_U8 * pu8Data, MS_U32 u32Size)
+{
+    MS_BOOL bRet = TRUE;
+    MS_U32 u32Done = 0;
+
+    MS_ASSERT( MsOS_In_Interrupt() == FALSE );
+    MS_ASSERT(_HAL_SERFLASH_Check51RunMode());
+
+    if (FALSE == MS_SERFLASH_OBTAIN_MUTEX(_s32SERFLASH_Mutex, SERFLASH_MUTEX_WAIT_TIME))
+    {
+        printk("%s ENTRY fails!\n", __FUNCTION__);
+        return FALSE;
+    }
+
+    while (u32Done < u32Size)
+    {
+        MS_U32 u32Chunk = u32Size - u32Done;
+
+        if (u32Chunk > SPI_RDUID_CHUNK)
+            u32Chunk = SPI_RDUID_CHUNK;
+
+        if (!HAL_FSP_ReadUID(pu8Data + u32Done, u32Chunk, u32Done))
+        {
+            bRet = FALSE;
+            break;
+        }
+
+        u32Done += u32Chunk;
+    }
+
+    MS_SERFLASH_RELEASE_MUTEX(_s32SERFLASH_Mutex);
+
     return bRet;
 }
 

@@ -13,6 +13,7 @@ EXTRA_CFLAGS      +=  -DMSOS_TYPE_LINUX
 
 # files
 obj-$(CONFIG_MS_FLASH_ISP)  += drvSERFLASH.o mtd_serflash.o drvDeviceInfo.o
+obj-$(CONFIG_MS_FLASH_ISP)  += uid_proc.o
 obj-$(CONFIG_MS_FLASH_ISP)  += $(CONFIG_SSTAR_CHIP_NAME)/halSERFLASH.o
 obj-$(CONFIG_MS_FLASH_ISP_MXP_PARTS) += part_mxp.o mxp_flash.o
 

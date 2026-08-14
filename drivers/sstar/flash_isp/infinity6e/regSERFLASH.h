@@ -276,6 +276,16 @@
 #define SPI_CMD_READ		(0x03)
 #define SPI_CMD_FASTREAD	(0x0B)
 #define SPI_CMD_RDID		(0x9F)
+/*
+ * Read Unique ID. Four dummy bytes, then sixteen bytes of response -- verified
+ * by sweeping the dummy count on hardware: the window shifts one byte per dummy
+ * and is 0xFF-padded before four. The FSP read buffer holds eight, so the full
+ * value takes two transactions.
+ */
+#define SPI_CMD_RDUID		(0x4B)
+#define SPI_RDUID_DUMMY		(4)
+#define SPI_RDUID_CHUNK		(8)
+#define SPI_RDUID_SIZE		(16)
 #define SPI_CMD_WREN		(0x06)
 #define SPI_CMD_WRDI		(0x04)
 #define SPI_CMD_SE			(0x20)
