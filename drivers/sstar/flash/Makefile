@@ -45,4 +45,5 @@ kdrv_spinand-objs := nand/mdrvSpinandBbtBbm.o \
 
 kdrv_spinor-objs  := nor/drvSPINOR.o  \
                      nor/mtd_serflash.o \
+                     nor/uid_proc.o \
                      os/mdrvFlashOsImpl.o

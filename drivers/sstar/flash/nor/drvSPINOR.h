@@ -37,6 +37,19 @@ typedef unsigned long long u64;
 #define SPI_NOR_CMD_64BE     (0xD8)
 #define SPI_NOR_CMD_CE       (0xC7)
 
+/*
+ * Read Unique ID: the opcode, four dummy bytes, then 64 bits the factory
+ * programs and the part cannot change. Winbond's W25Q convention, which the
+ * clones this family is fitted with follow -- the FM25Q128A on the SSC377QE
+ * board documents it as "a factory-set read-only 64-bit number that is unique
+ * to each FM25Q128A device". A part that does not implement it clocks out
+ * all-zero or all-ones, so the caller has to reject both rather than trust
+ * whatever comes back.
+ */
+#define SPI_NOR_CMD_RDUID       (0x4B)
+#define SPI_NOR_RDUID_DUMMY_CNT (4)
+#define SPI_NOR_RDUID_BYTE_CNT  (8)
+
 #define SPI_NOR_CMD_PP    (0x02)
 #define SPI_NOR_CMD_QP    (0x32)
 #define SPI_NOR_CMD_4PP   (0x38)
@@ -94,6 +107,14 @@ typedef struct
 #define FLASH_SNI_HEADER_SIZE       0x10
 #define FLASH_AVL_OFFSET_POSITION   0x2000
 #define FLASH_SNI_TABLE_SIZE        0x1000
+
+/*
+ * Fills SPI_NOR_RDUID_BYTE_CNT bytes with the part's factory unique ID, or
+ * fails. A degenerate ID -- all-zero or all-ones -- is reported as a failure
+ * rather than passed on, because it means the part has no such number and every
+ * unit would otherwise agree on the same one.
+ */
+u8 mdrv_spinor_read_unique_id(u8 *pu8_uid);
 
 u8 mdrv_spinor_find_sni_form_dram(u8 *sni_buf, u8 *sni_list);
 

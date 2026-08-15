@@ -1574,6 +1574,88 @@ u8 mdrv_spinor_read(u32 u32_address, u8 *pu8_data, u32 u32_size)
     return u8_status;
 }
 
+/*
+ * The part's factory unique ID.
+ *
+ * Read Unique ID is an opcode, four dummy bytes, then the eight that matter.
+ * Dummy bytes are only clocks, so this asks for twelve and keeps the last
+ * eight rather than driving the bus in three steps: drv_spinor_read_after_write
+ * already sends one command byte and clocks back as many as it is asked for,
+ * and it is available whatever CONFIG_FLASH_FIX_DI_PULL_DOWN and
+ * CONFIG_FLASH_HW_CS are set to. The lower-level primitives are not.
+ *
+ * Read-only and side-effect free: no write enable, no status polling, nothing
+ * latched in the part, so it is safe to issue between any two other operations.
+ */
+u8 mdrv_spinor_read_unique_id(u8 *pu8_uid)
+{
+    u8 au8_cmd[1 + SPI_NOR_RDUID_DUMMY_CNT];
+    u8 u8_rsize;
+    u8 u8_i;
+    u8 u8_and = 0xFF;
+    u8 u8_or  = 0x00;
+
+    if (!g_pst_spinor_sni || !pu8_uid)
+    {
+        return ERR_SPINOR_DEVICE_FAILURE;
+    }
+
+    /*
+     * THE DUMMY BYTES GO IN THE WRITE PHASE, NOT THE READ PHASE
+     *
+     * This used to ask for the dummy bytes and the ID in one read --
+     * drv_spinor_complete_read_status(cmd, frame, 12) -- and drop the first
+     * four. That silently returned a truncated ID: the read length is clamped
+     * to what the FSP read buffer holds, so a request for twelve came back with
+     * ten, and the last two bytes of the ID stayed zero from the memset. On the
+     * bring-up board it read 114a3f3b09910000 where U-Boot's uidraw, which
+     * issues the same opcode on the same part, had 114a3f3b09914824. Six bytes
+     * of agreement is not agreement, and nothing caught it because the value
+     * still looked like an ID.
+     *
+     * Clocking the dummies out as part of the command leaves the read phase
+     * asking for exactly the eight bytes wanted, which fits. This is the shape
+     * drv_spinor_read already uses for a fast read (opcode, address, dummy).
+     */
+    au8_cmd[0] = SPI_NOR_CMD_RDUID;
+    memset(au8_cmd + 1, 0, SPI_NOR_RDUID_DUMMY_CNT);
+    memset(pu8_uid, 0, SPI_NOR_RDUID_BYTE_CNT);
+
+    DRV_QSPI_pull_cs(0);
+    u8_rsize = drv_spinor_read_after_write(au8_cmd, sizeof(au8_cmd), pu8_uid, SPI_NOR_RDUID_BYTE_CNT);
+    DRV_QSPI_pull_cs(1);
+
+    /*
+     * A short read is a failure, not a value. The clamp above is exactly how
+     * this went wrong before, so the length actually transferred is checked
+     * rather than assumed.
+     */
+    if (SPI_NOR_RDUID_BYTE_CNT != u8_rsize)
+    {
+        return drv_spinor_return_status(ERR_SPINOR_TIMEOUT);
+    }
+
+    /*
+     * All-zero or all-ones means the part answered the opcode with nothing --
+     * either it implements no unique number, or the bus read back idle. Both
+     * are identical on every unit, and a caller deriving an identity from one
+     * would hand the whole fleet the same address, so this is a failure rather
+     * than a value.
+     */
+    for (u8_i = 0; SPI_NOR_RDUID_BYTE_CNT > u8_i; u8_i++)
+    {
+        u8_and &= pu8_uid[u8_i];
+        u8_or |= pu8_uid[u8_i];
+    }
+
+    if (0x00 == u8_or || 0xFF == u8_and)
+    {
+        return ERR_SPINOR_INVALID;
+    }
+
+    return ERR_SPINOR_SUCCESS;
+}
+
 u8 mdrv_spinor_program(u32 u32_address, u8 *pu8_data, u32 u32_size)
 {
     u16 u16_write_size;
